@@ -586,9 +586,11 @@
     var shell = el('div', { class: 'shell' });
     shell.appendChild(header());
     shell.appendChild(hero());
-    shell.appendChild(modelPanel());
+    // The radar comes first and the model's derivation after it: the board is what a reader
+    // opens the page for, and a ranking that starts page three is a ranking nobody reads.
     shell.appendChild(controls());
     shell.appendChild(board());
+    shell.appendChild(modelPanel());
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');
     if (!dialog.isConnected) app.appendChild(dialog);
