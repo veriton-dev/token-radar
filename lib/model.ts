@@ -5,20 +5,25 @@
 // entry carries no market cap, no CoinGecko id and no symbol; the protocols whose token already trades
 // are kept in a separate view, with the market's own market-cap figure, never mixed into the ranking.
 //
-// Implied value follows only from the snapshot's own figures. The peer multiple is *derived* each run
-// from the protocols that already trade: each traded protocol's market cap over its TVL is one peer
-// multiple, the median of a category's multiples (at least three peers) is that category's multiple,
-// and a category with fewer peers falls back to the median of every traded peer. No name is hardcoded.
+// Implied value follows only from the snapshot's own figures. The multiple is *fitted* each run from
+// the protocols that already trade. In log space, with y = ln(mcap_usd / tvl_usd):
 //
-//   peer       = median(mcap_usd / tvl_usd) over the category's traded peers, else the global median
-//   base       = tvl_usd x peer
-//   growthPct  = clamp(change_7d or 0, -60, +120)
-//   growthMult = 1 + (growthPct / 100) x 0.35
-//   age        = whole days since listed_at; unknown -> null
-//   waitMult   = 0.55 + min(age ?? 180, 1460) / 1460 x 0.45
-//   chainMult  = 1 + 0.03 x min(len(chains) - 1, 4)
-//   thinMult   = change_7d is null ? 0.85 : 1
-//   implied    = max(1, round(base x growthMult x waitMult x chainMult x thinMult))
+//   y ~ b0 + b1 z + b2 g + b3 nc
+//
+// where z standardises log10(tvl_usd) over the training set, g is the clamped seven-day change over
+// 100 and nc is min(len(chains), 6). The normal equations are solved in plain TypeScript, with an
+// intercept-only fallback when the design matrix is near-singular. A category then gets the median
+// residual of its traded peers, shrunk by n / (n + K) so one peer barely moves a prediction:
+//
+//   predicted log multiple = fitted + shrunk category residual
+//   base                   = tvl_usd x exp(predicted log multiple)
+//   growthPct              = clamp(change_7d or 0, -60, +120)
+//   growthMult             = 1 + (growthPct / 100) x 0.35
+//   age                    = whole days since listed_at; unknown -> null
+//   waitMult               = 0.55 + min(age ?? 180, 1460) / 1460 x 0.45
+//   chainMult              = 1 + 0.03 x min(len(chains) - 1, 4)
+//   thinMult               = change_7d is null ? 0.85 : 1
+//   implied                = max(1, round(base x growthMult x waitMult x chainMult x thinMult))
 //
 // The range is 0.6x and 1.6x of the point estimate; the ranking only ever uses the point estimate.
 
@@ -60,6 +65,7 @@ export interface ModelConstants {
   range_low: number;
   range_high: number;
   min_peer_count: number;
+  shrink_k: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -76,10 +82,11 @@ export const MODEL: ModelConstants = {
   range_low: 0.6,
   range_high: 1.6,
   min_peer_count: 3,
+  shrink_k: 8,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -110,6 +117,48 @@ export interface PeerUse {
   peers: number;
 }
 
+/** One training row: a traded protocol's log multiple and the three predictors, before standardisation. */
+export interface TrainingRow {
+  slug: string;
+  category: string | null;
+  y: number;
+  log10_tvl: number;
+  g: number;
+  nc: number;
+}
+
+/** One category's median residual from the fitted surface, its peer count and the shrunk adjustment. */
+export interface CategoryResidual {
+  category: string;
+  count: number;
+  residual: number;
+  shrunk: number;
+}
+
+/** The held-out comparison: baseline mean, the fitted surface and the old category-median approach. */
+export interface CvResult {
+  folds: number;
+  rows: number;
+  baseline_rmse: number;
+  fitted_rmse: number;
+  category_rmse: number;
+}
+
+/** The fitted value model: its coefficients, the standardisation it trained on, and its category residuals. */
+export interface FittedModel {
+  b0: number;
+  b1: number;
+  b2: number;
+  b3: number;
+  mean_log10_tvl: number;
+  sd_log10_tvl: number;
+  training_count: number;
+  singular: boolean;
+  shrink_k: number;
+  residuals: CategoryResidual[];
+  cv: CvResult;
+}
+
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
   rank: number;
@@ -132,6 +181,16 @@ export interface BoardRow {
     base_multiple: number;
     peer_source: 'category' | 'global';
     peer_count: number;
+    b0: number;
+    b1: number;
+    b2: number;
+    b3: number;
+    z: number;
+    g: number;
+    nc: number;
+    residual_category: number;
+    n_category: number;
+    predicted_multiple: number;
     base_value_usd: number;
     growth_pct: number;
     growth_multiplier: number;
@@ -161,6 +220,16 @@ export interface RadarRow {
   peer_multiple: number;
   peer_source: 'category' | 'global';
   peer_count: number;
+  b0: number;
+  b1: number;
+  b2: number;
+  b3: number;
+  z: number;
+  g: number;
+  nc: number;
+  residual_category: number;
+  n_category: number;
+  predicted_multiple: number;
   base_value_usd: number;
   growth_pct: number;
   growth_multiplier: number;
@@ -195,6 +264,7 @@ export interface RadarData {
   early_size: number;
   live_size: number;
   peer_table: PeerTable;
+  fitted_model: FittedModel;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -280,13 +350,241 @@ export function peerFor(category: string | null, table: PeerTable, model: ModelC
   return { multiple: table.global_multiple, source: 'global', peers: table.global_count };
 }
 
-/** One protocol's computed terms: the peer it uses, every multiplier, the point estimate and its range. */
+/** The predictor triple, standardised on the training set the fit was solved with. */
+export function predictors(protocol: SnapshotProtocol, fit: Pick<FittedModel, 'mean_log10_tvl' | 'sd_log10_tvl'>, model: ModelConstants = MODEL): { z: number; g: number; nc: number } {
+  const log10tvl = Math.log10(Math.max(protocol.tvl_usd, 1));
+  const sd = fit.sd_log10_tvl > 0 ? fit.sd_log10_tvl : 1;
+  return {
+    z: (log10tvl - fit.mean_log10_tvl) / sd,
+    g: clamp(finite(protocol.change_7d, 0), model.growth_floor, model.growth_cap) / 100,
+    nc: Math.min(protocol.chains.length, 6),
+  };
+}
+
+/** The fitted surface's log multiple for a predictor triple. */
+function surfaceLog(fit: Pick<FittedModel, 'b0' | 'b1' | 'b2' | 'b3'>, x: { z: number; g: number; nc: number }): number {
+  return fit.b0 + fit.b1 * x.z + fit.b2 * x.g + fit.b3 * x.nc;
+}
+
+/** Every traded protocol as a training row: a recorded, positive market cap over a positive TVL, in log space. */
+export function trainingRows(snapshot: Snapshot, model: ModelConstants = MODEL): TrainingRow[] {
+  const rows: TrainingRow[] = [];
+  for (const p of snapshot.protocols) {
+    if (!isPeer(p) || (p.mcap_usd as number) <= 0 || p.tvl_usd <= 0) continue;
+    const y = Math.log((p.mcap_usd as number) / p.tvl_usd);
+    if (!Number.isFinite(y)) continue;
+    rows.push({
+      slug: p.slug,
+      category: p.category,
+      y,
+      log10_tvl: Math.log10(p.tvl_usd),
+      g: clamp(finite(p.change_7d, 0), model.growth_floor, model.growth_cap) / 100,
+      nc: Math.min(p.chains.length, 6),
+    });
+  }
+  return rows;
+}
+
+/** The mean and population standard deviation of a list, with a standard deviation that is never zero. */
+function moments(values: number[]): { mean: number; sd: number } {
+  if (values.length === 0) return { mean: 0, sd: 1 };
+  const mean = values.reduce((a, v) => a + v, 0) / values.length;
+  let variance = 0;
+  for (const v of values) variance += (v - mean) * (v - mean);
+  variance /= values.length;
+  const sd = Math.sqrt(variance);
+  return { mean, sd: sd > 0 && Number.isFinite(sd) ? sd : 1 };
+}
+
+/** Solve A beta = b by Gauss-Jordan elimination with partial pivoting; null when a pivot is too small. */
+function solveLinear(A: number[][], b: number[]): number[] | null {
+  const k = b.length;
+  const M = A.map((row, i) => [...row, b[i] as number]);
+  let scale = 0;
+  for (let i = 0; i < k; i++) scale = Math.max(scale, Math.abs(M[i]![i]!));
+  const eps = 1e-10 * Math.max(1, scale);
+  for (let col = 0; col < k; col++) {
+    let pivot = col;
+    for (let row = col + 1; row < k; row++) {
+      if (Math.abs(M[row]![col]!) > Math.abs(M[pivot]![col]!)) pivot = row;
+    }
+    if (!(Math.abs(M[pivot]![col]!) > eps)) return null;
+    if (pivot !== col) {
+      const tmp = M[col]!;
+      M[col] = M[pivot]!;
+      M[pivot] = tmp;
+    }
+    const diag = M[col]![col]!;
+    for (let j = col; j <= k; j++) M[col]![j] = M[col]![j]! / diag;
+    for (let row = 0; row < k; row++) {
+      if (row === col) continue;
+      const factor = M[row]![col]!;
+      if (factor === 0) continue;
+      for (let j = col; j <= k; j++) M[row]![j] = M[row]![j]! - factor * M[col]![j]!;
+    }
+  }
+  return M.map((row) => row[k]!);
+}
+
+/** Fit y ~ b0 + b1 z + b2 g + b3 nc by normal equations, falling back to the intercept when singular. */
+function fitSurface(rows: TrainingRow[]): Pick<FittedModel, 'b0' | 'b1' | 'b2' | 'b3' | 'mean_log10_tvl' | 'sd_log10_tvl' | 'singular'> {
+  const momentsOfTvl = moments(rows.map((r) => r.log10_tvl));
+  const intercept = rows.length > 0 ? rows.reduce((a, r) => a + r.y, 0) / rows.length : 0;
+  const k = 4;
+  const A = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+  const rhs = new Array<number>(k).fill(0);
+  for (const r of rows) {
+    const x = [1, (r.log10_tvl - momentsOfTvl.mean) / momentsOfTvl.sd, r.g, r.nc];
+    for (let i = 0; i < k; i++) {
+      rhs[i] += x[i]! * r.y;
+      for (let j = 0; j < k; j++) A[i]![j] += x[i]! * x[j]!;
+    }
+  }
+  const beta = rows.length >= k ? solveLinear(A, rhs) : null;
+  if (beta === null || beta.some((v) => !Number.isFinite(v))) {
+    return { b0: intercept, b1: 0, b2: 0, b3: 0, mean_log10_tvl: momentsOfTvl.mean, sd_log10_tvl: momentsOfTvl.sd, singular: true };
+  }
+  return {
+    b0: beta[0]!,
+    b1: beta[1]!,
+    b2: beta[2]!,
+    b3: beta[3]!,
+    mean_log10_tvl: momentsOfTvl.mean,
+    sd_log10_tvl: momentsOfTvl.sd,
+    singular: false,
+  };
+}
+
+/** Each category's median residual from the surface, shrunk by count / (count + K). */
+function categoryResiduals(rows: TrainingRow[], fit: ReturnType<typeof fitSurface>, shrinkK: number): Map<string, { count: number; residual: number; shrunk: number }> {
+  const groups = new Map<string, number[]>();
+  for (const r of rows) {
+    if (r.category === null) continue;
+    const residual = r.y - surfaceLog(fit, predictorsForRow(r, fit));
+    const group = groups.get(r.category);
+    if (group === undefined) groups.set(r.category, [residual]);
+    else group.push(residual);
+  }
+  const out = new Map<string, { count: number; residual: number; shrunk: number }>();
+  for (const [category, values] of groups) {
+    const residual = median(values) ?? 0;
+    const count = values.length;
+    out.set(category, { count, residual, shrunk: (residual * count) / (count + shrinkK) });
+  }
+  return out;
+}
+
+/** A training row's predictor triple under a fit's standardisation. */
+function predictorsForRow(row: TrainingRow, fit: { mean_log10_tvl: number; sd_log10_tvl: number }): { z: number; g: number; nc: number } {
+  return { z: (row.log10_tvl - fit.mean_log10_tvl) / (fit.sd_log10_tvl > 0 ? fit.sd_log10_tvl : 1), g: row.g, nc: row.nc };
+}
+
+/** A stable FNV-1a hash of a slug, so folds never move between runs or Node versions. */
+export function stableHash(text: string): number {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
+
+/** Root-mean-square error of a list. */
+function rmse(errors: number[]): number {
+  if (errors.length === 0) return 0;
+  return Math.sqrt(errors.reduce((a, e) => a + e * e, 0) / errors.length);
+}
+
+/**
+ * The honest held-out comparison: five folds assigned by `stableHash(slug) % 5`, each fold scored by a model
+ * trained on the other four. The baseline predicts the training mean log multiple; the category approach is
+ * the old peerFor rule (a category median with at least three peers, else the global median); the fitted
+ * surface carries its own shrunk category residuals.
+ */
+export function crossValidate(rows: TrainingRow[], model: ModelConstants = MODEL): CvResult {
+  const folds = 5;
+  const baselineErrors: number[] = [];
+  const fittedErrors: number[] = [];
+  const categoryErrors: number[] = [];
+  for (let fold = 0; fold < folds; fold++) {
+    const train = rows.filter((r) => stableHash(r.slug) % folds !== fold);
+    const test = rows.filter((r) => stableHash(r.slug) % folds === fold);
+    if (train.length === 0 || test.length === 0) continue;
+    const trainMean = train.reduce((a, r) => a + r.y, 0) / train.length;
+    const fit = fitSurface(train);
+    const residuals = categoryResiduals(train, fit, model.shrink_k);
+
+    const categoryMultiples = new Map<string, number[]>();
+    for (const r of train) {
+      if (r.category === null) continue;
+      const group = categoryMultiples.get(r.category);
+      if (group === undefined) categoryMultiples.set(r.category, [Math.exp(r.y)]);
+      else group.push(Math.exp(r.y));
+    }
+    const categoryMedian = new Map<string, { median: number; count: number }>();
+    for (const [category, values] of categoryMultiples) {
+      categoryMedian.set(category, { median: median(values) ?? 0, count: values.length });
+    }
+    const globalMedian = median(train.map((r) => Math.exp(r.y))) ?? 0;
+
+    for (const r of test) {
+      baselineErrors.push(r.y - trainMean);
+      const x = predictorsForRow(r, fit);
+      const shrunk = r.category !== null ? (residuals.get(r.category)?.shrunk ?? 0) : 0;
+      fittedErrors.push(r.y - (surfaceLog(fit, x) + shrunk));
+      const cm = r.category !== null ? categoryMedian.get(r.category) : undefined;
+      const predicted = cm !== undefined && cm.count >= model.min_peer_count ? Math.log(cm.median) : Math.log(globalMedian);
+      categoryErrors.push(r.y - predicted);
+    }
+  }
+  return {
+    folds,
+    rows: rows.length,
+    baseline_rmse: rmse(baselineErrors),
+    fitted_rmse: rmse(fittedErrors),
+    category_rmse: rmse(categoryErrors),
+  };
+}
+
+/** Fit the value model on every traded protocol, with its category residuals and its cross-validation. */
+export function fitValueModel(snapshot: Snapshot, model: ModelConstants = MODEL): FittedModel {
+  const rows = trainingRows(snapshot, model);
+  const fit = fitSurface(rows);
+  const residuals = categoryResiduals(rows, fit, model.shrink_k);
+  const list: CategoryResidual[] = [...residuals.entries()]
+    .map(([category, v]) => ({ category, count: v.count, residual: v.residual, shrunk: v.shrunk }))
+    .sort((a, b) => b.count - a.count || (a.category < b.category ? -1 : a.category > b.category ? 1 : 0));
+  return {
+    ...fit,
+    training_count: rows.length,
+    shrink_k: model.shrink_k,
+    residuals: list,
+    cv: crossValidate(rows, model),
+  };
+}
+
+/** The predicted mcap/TVL multiple and its log for one protocol: the surface plus its shrunk category residual. */
+export function predictMultiple(protocol: SnapshotProtocol, fitted: FittedModel, model: ModelConstants = MODEL): { log: number; multiple: number; z: number; g: number; nc: number; residual: number; nCategory: number } {
+  const x = predictors(protocol, fitted, model);
+  const residual = protocol.category !== null ? (fitted.residuals.find((r) => r.category === protocol.category)?.shrunk ?? 0) : 0;
+  const nCategory = protocol.category !== null ? (fitted.residuals.find((r) => r.category === protocol.category)?.count ?? 0) : 0;
+  const log = surfaceLog(fitted, x) + residual;
+  return { log, multiple: Math.exp(log), z: x.z, g: x.g, nc: x.nc, residual, nCategory };
+}
+
+/** One protocol's computed terms: the fitted multiple, every multiplier, the point estimate and its range. */
 export interface Scored {
   implied: number;
   low: number;
   high: number;
   baseValue: number;
   peer: PeerUse;
+  predictedMultiple: number;
+  z: number;
+  g: number;
+  nc: number;
+  residual: number;
+  nCategory: number;
   growthPct: number;
   growthMult: number;
   age: number | null;
@@ -297,10 +595,15 @@ export interface Scored {
 }
 
 /** The model applied to one protocol. The same function scores every row; no name is read. */
-export function impliedValue(protocol: SnapshotProtocol, asOf: string, table: PeerTable, model: ModelConstants = MODEL): Scored {
+export function impliedValue(protocol: SnapshotProtocol, asOf: string, fitted: FittedModel, model: ModelConstants = MODEL): Scored {
   const age = ageDays(asOf, protocol.listed_at);
-  const peer = peerFor(protocol.category, table, model);
-  const baseValue = protocol.tvl_usd * peer.multiple;
+  const prediction = predictMultiple(protocol, fitted, model);
+  const peer: PeerUse = {
+    multiple: prediction.multiple,
+    source: prediction.nCategory > 0 ? 'category' : 'global',
+    peers: prediction.nCategory > 0 ? prediction.nCategory : fitted.training_count,
+  };
+  const baseValue = protocol.tvl_usd * prediction.multiple;
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = clamp(rawGrowth, model.growth_floor, model.growth_cap);
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
@@ -311,7 +614,26 @@ export function impliedValue(protocol: SnapshotProtocol, asOf: string, table: Pe
   const implied = Math.max(1, Math.round(baseValue * growthMult * waitMult * chainMult * thinMult));
   const low = Math.max(1, Math.round(implied * model.range_low));
   const high = Math.max(low, Math.round(implied * model.range_high));
-  return { implied, low, high, baseValue, peer, growthPct, growthMult, age, waitDays, waitMult, chainMult, thinMult };
+  return {
+    implied,
+    low,
+    high,
+    baseValue,
+    peer,
+    predictedMultiple: prediction.multiple,
+    z: prediction.z,
+    g: prediction.g,
+    nc: prediction.nc,
+    residual: prediction.residual,
+    nCategory: prediction.nCategory,
+    growthPct,
+    growthMult,
+    age,
+    waitDays,
+    waitMult,
+    chainMult,
+    thinMult,
+  };
 }
 
 /** Whether a protocol records no token at all. */
@@ -375,7 +697,7 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n and the watchlist always covered. */
-export function buildBoard(snapshot: Snapshot, table: PeerTable = buildPeerTable(snapshot), model: ModelConstants = MODEL): BoardRow[] {
+export function buildBoard(snapshot: Snapshot, fitted: FittedModel = fitValueModel(snapshot), model: ModelConstants = MODEL): BoardRow[] {
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries.
@@ -388,7 +710,7 @@ export function buildBoard(snapshot: Snapshot, table: PeerTable = buildPeerTable
     if (isRankable(p)) chosen.set(p.slug, p);
   }
 
-  const scored = [...chosen.values()].map((p) => ({ p, s: impliedValue(p, snapshot.as_of, table, model) }));
+  const scored = [...chosen.values()].map((p) => ({ p, s: impliedValue(p, snapshot.as_of, fitted, model) }));
   scored.sort((a, b) => b.s.implied - a.s.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((entry, i) => {
     const { p, s } = entry;
@@ -413,6 +735,16 @@ export function buildBoard(snapshot: Snapshot, table: PeerTable = buildPeerTable
         base_multiple: round4(s.peer.multiple),
         peer_source: s.peer.source,
         peer_count: s.peer.peers,
+        b0: round4(fitted.b0),
+        b1: round4(fitted.b1),
+        b2: round4(fitted.b2),
+        b3: round4(fitted.b3),
+        z: round4(s.z),
+        g: round4(s.g),
+        nc: s.nc,
+        residual_category: round4(s.residual),
+        n_category: s.nCategory,
+        predicted_multiple: s.predictedMultiple,
         base_value_usd: Math.round(s.baseValue),
         growth_pct: round4(s.growthPct),
         growth_multiplier: round4(s.growthMult),
@@ -582,6 +914,16 @@ export function radarRow(row: BoardRow): RadarRow {
     peer_multiple: row.model.base_multiple,
     peer_source: row.model.peer_source,
     peer_count: row.model.peer_count,
+    b0: row.model.b0,
+    b1: row.model.b1,
+    b2: row.model.b2,
+    b3: row.model.b3,
+    z: row.model.z,
+    g: row.model.g,
+    nc: row.model.nc,
+    residual_category: row.model.residual_category,
+    n_category: row.model.n_category,
+    predicted_multiple: row.model.predicted_multiple,
     base_value_usd: row.model.base_value_usd,
     growth_pct: row.model.growth_pct,
     growth_multiplier: row.model.growth_multiplier,
@@ -594,9 +936,10 @@ export function radarRow(row: BoardRow): RadarRow {
 }
 
 /** Everything the dashboard renders, from the snapshot. */
-export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData; peerTable: PeerTable } {
+export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData; peerTable: PeerTable; fitted: FittedModel } {
   const peerTable = buildPeerTable(snapshot, model);
-  const board = buildBoard(snapshot, peerTable, model);
+  const fitted = fitValueModel(snapshot, model);
+  const board = buildBoard(snapshot, fitted, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
@@ -610,10 +953,11 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     early_size: early,
     live_size: live.length,
     peer_table: peerTable,
+    fitted_model: fitted,
     rows: board.map(radarRow),
     live,
   };
-  return { board, radar, peerTable };
+  return { board, radar, peerTable, fitted };
 }
 
 /** The snapshot out of a file's text, refused unless it is the shape the model scores. */

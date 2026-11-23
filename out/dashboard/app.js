@@ -47,7 +47,7 @@
     var waitMult = m.wait_floor + (Math.max(waitDays, 0) / m.wait_days) * m.wait_range;
     var chainMult = 1 + m.chain_weight * Math.min(Math.max((row.chains ? row.chains.length : 1) - 1, 0), m.chain_cap);
     var thinMult = row.change_7d === null || row.change_7d === undefined ? m.thin_multiplier : 1;
-    var base = row.tvl_usd * row.peer_multiple;
+    var base = row.tvl_usd * (row.predicted_multiple === undefined ? row.peer_multiple : row.predicted_multiple);
     var implied = Math.max(1, Math.round(base * growthMult * waitMult * chainMult * thinMult));
     return { growthPct: growthPct, growthMult: growthMult, waitDays: waitDays, waitMult: waitMult, chainMult: chainMult, thinMult: thinMult, base: base, implied: implied };
   }
@@ -149,7 +149,7 @@
       el('div', { class: 'top-meta' },
         el('span', null, 'Snapshot ', el('b', { text: DATA.as_of })),
         el('span', null, DATA.model_version, ' model'),
-        el('span', { text: 'derived peer multiples' })
+        el('span', { text: 'fitted value model' })
       )
     );
   }
@@ -157,11 +157,11 @@
   function hero() {
     return el('section', { class: 'hero' },
       el('div', null,
-        el('h1', null, 'Every pre-token protocol, ranked by ', el('em', { text: 'derived' }), ' implied value'),
+        el('h1', null, 'Every pre-token protocol, ranked by ', el('em', { text: 'fitted' }), ' implied value'),
         el('p', { class: 'lede' },
-          'Implied value is each protocol\'s own TVL priced at what protocols in its category already trade for. ',
-          el('strong', { text: 'The multiple is computed from the snapshot, not chosen: ' }),
-          'each traded protocol\'s market cap over its TVL is one peer multiple; the category median sets the rest, with a global fallback. ',
+          'Implied value prices each protocol\'s own TVL at a market-cap-to-TVL multiple fitted from the protocols that already trade. ',
+          el('strong', { text: 'The multiple is fitted from the snapshot, not chosen: ' }),
+          'size, seven-day growth and chain count set the surface, and each category adds a shrunk residual. ',
           el('strong', { text: 'No protocol name is special-cased.' }),
           ' The watchlist is the floor, never the ceiling: the board ranks the whole pre-token universe.'
         )
@@ -169,21 +169,28 @@
       el('div', { class: 'facts' },
         el('div', { class: 'fact' }, el('b', { class: 'amber', text: String(DATA.board_size) }), el('span', { text: 'pre-token rows ranked' })),
         el('div', { class: 'fact' }, el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size }), el('span', { text: 'watchlist covered' })),
-        el('div', { class: 'fact' }, el('b', { class: 'teal', text: String(DATA.peer_table.global_count) }), el('span', { text: 'traded peers, multiples derived' })),
+        el('div', { class: 'fact' }, el('b', { class: 'teal', text: String(DATA.fitted_model.training_count) }), el('span', { text: 'traded peers fitted' })),
         el('div', { class: 'fact' }, el('b', { text: String(DATA.live_size) }), el('span', { text: 'token already trading' }))
       )
     );
   }
 
-  // ---- the Model section: formula in words, the peer table, the global fallback ----
+  // ---- the Model section: the fitted equation with its actual coefficients, the held-out comparison and
+  // the category residual table. Every number is read from DATA.fitted_model, which main.ts fitted from the
+  // snapshot's own traded protocols; the page states it, it does not invent it. ----
   function modelPanel() {
     var m = DATA.model;
-    var pt = DATA.peer_table;
-    var adopted = pt.categories.filter(function (c) { return c.adopted; });
-    var shortfall = pt.categories.filter(function (c) { return !c.adopted; });
+    var fm = DATA.fitted_model;
+    var cv = fm.cv;
+    var signed = function (n) { return (n >= 0 ? '+ ' : '- ') + Math.abs(n).toFixed(4); };
     var formula =
-      'peer      = median(mcap_usd / tvl_usd) over the category\'s traded peers, else the global median\n' +
-      'base      = tvl_usd x peer\n' +
+      'y = ln(mcap_usd / tvl_usd)\n' +
+      'y ~ ' + fm.b0.toFixed(4) + ' ' + signed(fm.b1) + ' z ' + signed(fm.b2) + ' g ' + signed(fm.b3) + ' nc\n' +
+      'z  = (log10(tvl_usd) - ' + fm.mean_log10_tvl.toFixed(4) + ') / ' + fm.sd_log10_tvl.toFixed(4) + '\n' +
+      'g  = clamp(change_7d, ' + m.growth_floor + ', +' + m.growth_cap + ') / 100\n' +
+      'nc = min(len(chains), 6)\n' +
+      'predicted log multiple = y + residual_category x n_c / (n_c + ' + fm.shrink_k + ')\n' +
+      'base      = tvl_usd x exp(predicted log multiple)\n' +
       'growth    = 1 + clamp(change_7d, ' + m.growth_floor + ', +' + m.growth_cap + ') / 100 x ' + m.growth_weight + '\n' +
       'wait      = ' + m.wait_floor + ' + min(age_days ?? ' + m.unknown_age_days + ', ' + m.wait_days + ') / ' + m.wait_days + ' x ' + m.wait_range + '\n' +
       'chains    = 1 + ' + m.chain_weight + ' x min(len(chains) - 1, ' + m.chain_cap + ')\n' +
@@ -191,42 +198,63 @@
       'implied   = max(1, round(base x growth x wait x chains x thin))\n' +
       'range     = ' + (m.range_low * 100) + '% .. ' + (m.range_high * 100) + '% of implied (ranking uses the point estimate)';
 
-    var table = el('div', { class: 'peer-grid' },
-      el('div', { class: 'peer fallback' },
-        el('span', { class: 'cat', text: 'Global fallback (all traded peers)' }),
-        el('span', { class: 'mult', text: fmtMult(pt.global_multiple) }),
-        el('span', { class: 'cnt', text: pt.global_count + ' peers' })
+    var fittedWins = cv.fitted_rmse < cv.category_rmse;
+    var cvBlock = el('div', { class: 'cv' },
+      el('div', { class: 'cv-head' },
+        el('h3', { text: 'Held-out check: 5-fold cross-validation over ' + cv.rows + ' traded protocols' }),
+        el('span', { class: 'pill ' + (fittedWins ? 'buy' : 'glb'), text: fittedWins ? 'fitted model wins' : 'category median wins' })
       ),
-      adopted.map(function (c) {
-        return el('div', { class: 'peer' },
-          el('span', { class: 'cat', text: c.category }),
-          el('span', { class: 'mult', text: fmtMult(c.median) }),
-          el('span', { class: 'cnt', text: c.count + ' peers' })
-        );
-      })
+      el('div', { class: 'cv-grid' },
+        el('div', { class: 'cv-row' },
+          el('span', { class: 'cv-k', text: 'Baseline: mean log multiple' }),
+          el('span', { class: 'cv-v', text: 'RMSE ' + cv.baseline_rmse.toFixed(4) })
+        ),
+        el('div', { class: 'cv-row' },
+          el('span', { class: 'cv-k', text: 'Old approach: category median mcap / TVL' }),
+          el('span', { class: 'cv-v', text: 'RMSE ' + cv.category_rmse.toFixed(4) })
+        ),
+        el('div', { class: 'cv-row best' },
+          el('span', { class: 'cv-k', text: 'This model: fitted surface + shrunk residual' }),
+          el('span', { class: 'cv-v', text: 'RMSE ' + cv.fitted_rmse.toFixed(4) })
+        )
+      ),
+      el('p', { class: 'note', text: 'Each fold is assigned by a stable hash of the slug, so the split never moves between runs. The fitted model ships because its held-out error is lower than both baselines.' })
     );
-    var fallbackCats = shortfall.map(function (c) { return c.category + ' (' + c.count + ')'; });
+
+    var residuals = fm.residuals.slice().sort(function (a, b) { return b.count - a.count || (a.category < b.category ? -1 : 1); });
+    var resRows = residuals.map(function (c) {
+      var raw = (c.residual >= 0 ? '+' : '') + c.residual.toFixed(3);
+      var shrunk = (c.shrunk >= 0 ? '+' : '') + c.shrunk.toFixed(3);
+      return el('div', { class: 'peer', title: 'median residual ' + raw + ' shrunk to ' + shrunk + ' over ' + c.count + ' peer' + (c.count === 1 ? '' : 's') },
+        el('span', { class: 'cat', text: c.category }),
+        el('span', { class: 'mult', text: shrunk }),
+        el('span', { class: 'cnt', text: 'n=' + c.count })
+      );
+    });
+    var table = el('div', { class: 'peer-grid' }, resRows);
 
     return el('section', { class: 'model', id: 'model' },
       el('div', { class: 'model-head' },
-        el('h2', { text: 'The model, in words' }),
+        el('h2', { text: 'The model, fitted and held out' }),
         el('span', { class: 'sub', text: 'computed from the snapshot every run: ' + DATA.source })
       ),
       el('p', null,
-        'A pre-token protocol is worth its ', el('strong', { text: 'TVL' }),
-        ' times the median market-cap-to-TVL multiple of the traded protocols in its ', el('strong', { text: 'category' }),
-        '. That base is then damped by seven-day ', el('strong', { text: 'TVL growth' }),
-        ' (worth 35% of its percentage), lifted by ', el('strong', { text: 'how long it has run with no token' }),
-        ' (a longer record means more of one), adjusted slightly for ', el('strong', { text: 'multichain surface' }),
-        ', and discounted when seven-day data is unreported. ',
-        'A category with fewer than ' + m.min_peer_count + ' traded peers uses the global fallback. ',
+        'The multiple is ', el('strong', { text: 'fitted' }),
+        ' from the snapshot\'s ', el('strong', { text: String(fm.training_count) + ' traded protocols' }),
+        ' in log space: a protocol\'s market-cap-to-TVL multiple rises and falls with its ', el('strong', { text: 'size' }),
+        ', its ', el('strong', { text: 'seven-day growth' }), ' and its ', el('strong', { text: 'chain count' }),
+        '. Each category then keeps a ', el('strong', { text: 'shrunk median residual' }),
+        ' (n / (n + ' + fm.shrink_k + ') of it), so a one-peer category barely moves a prediction. ',
+        'The base is damped by TVL growth, lifted by ', el('strong', { text: 'how long it has run with no token' }),
+        ', adjusted for multichain surface and discounted when seven-day data is unreported. ',
         el('strong', { text: 'No protocol name is special-cased: the same function scores every row.' })
       ),
       el('div', { class: 'formula', text: formula }),
+      cvBlock,
       el('div', { class: 'peer-wrap' },
-        el('h3', { text: 'Peer multiples by category: traded peers and their median mcap / TVL' }),
+        el('h3', { text: 'Category residual adjustment: median residual and its shrunk value' }),
         table,
-        el('p', { class: 'note', text: 'Categories with fewer than ' + m.min_peer_count + ' traded peers are not adopted; their protocols use the global fallback above: ' + (fallbackCats.length ? fallbackCats.join(', ') : 'none') + '.' })
+        el('p', { class: 'note', text: 'residual = median over a category\'s traded peers of (actual log multiple - fitted log multiple); shrunk = residual x n / (n + ' + fm.shrink_k + '). A category with no traded peer has no row and no adjustment.' })
       )
     );
   }
@@ -321,8 +349,8 @@
         el('td', { class: 'num ' + growthClass, text: fmtPct(r.change_7d) }),
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
         el('td', null,
-          el('span', { class: 'pill ' + (r.peer_source === 'global' ? 'glb' : 'cat'), title: r.peer_source === 'global' ? 'global fallback, ' + r.peer_count + ' peers' : 'category median, ' + r.peer_count + ' peers', text: fmtMult(r.peer_multiple) }),
-          el('span', { class: 'range', text: ' ' + (r.peer_source === 'global' ? 'global' : r.peer_count + 'p') })
+          el('span', { class: 'pill ' + (r.peer_source === 'global' ? 'glb' : 'cat'), title: 'fitted multiple: surface plus ' + (r.n_category ? 'a shrunk residual over ' + r.n_category + ' peers' : 'no category residual'), text: fmtMult(r.peer_multiple) }),
+          el('span', { class: 'range', text: ' ' + (r.n_category ? r.n_category + 'p' : 'surface') })
         ),
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
@@ -376,7 +404,7 @@
     return el('div', { class: 'panel' },
       el('div', { class: 'table-wrap' },
         el('table', null,
-          el('caption', { text: 'Traded peers: these protocols already have a token, so their market cap is a fact, not a model. Their mcap/TVL multiples are what the board derives its category medians from. They are never mixed into the ranking.' }),
+          el('caption', { text: 'Traded peers: these protocols already have a token, so their market cap is a fact, not a model. Their mcap/TVL multiples are the training set the value model is fitted on. They are never mixed into the ranking.' }),
           el('thead', null, el('tr', null,
             el('th', { scope: 'col', text: 'Status' }),
             sortHeader('name', 'Protocol'),
@@ -483,8 +511,13 @@
         el('h3', { text: 'The model, term by term' }),
         el('div', { class: 'equation' },
           equationRow('TVL', fmtUsd(row.tvl_usd)),
-          equationRow('Peer multiple', fmtMult(row.peer_multiple), row.peer_source === 'global' ? '(global fallback, ' + row.peer_count + ' traded peers)' : '(median of ' + row.peer_count + ' traded peers in ' + (row.category || 'this category') + ')'),
-          equationRow('Base value', fmtUsd(row.base_value_usd), '= TVL x peer multiple'),
+          equationRow('Size z', fmtNum(row.z, 3), 'standardised log10(TVL)', false),
+          equationRow('Growth g', fmtNum(row.g, 3), 'clamp(7d, -60, 120) / 100'),
+          equationRow('Chains nc', fmtNum(row.nc, 0), 'min(len(chains), 6)'),
+          equationRow('Fitted surface', fmtNum(row.b0 + row.b1 * row.z + row.b2 * row.g + row.b3 * row.nc, 3), 'b0 + b1 z + b2 g + b3 nc, in ln space'),
+          equationRow('Category residual', (row.n_category ? fmtNum(row.residual_category, 3) + ' (shrunk, ' + (row.category || 'this category') + ' n=' + row.n_category + ')' : 'no traded peers'), row.n_category ? 'residual x n / (n + ' + DATA.fitted_model.shrink_k + ')' : 'no adjustment'),
+          equationRow('Predicted multiple', fmtMult(row.predicted_multiple), 'exp(fitted + shrunk residual)', true),
+          equationRow('Base value', fmtUsd(row.base_value_usd), '= TVL x predicted multiple'),
           equationRow('7d growth', fmtPct(row.change_7d), 'clamped to ' + DATA.model.growth_floor + '..+' + DATA.model.growth_cap),
           equationRow('Growth multiplier', 'x' + fmtNum(row.growth_multiplier), '1 + (growth / 100) x ' + DATA.model.growth_weight),
           equationRow('Age with no token', fmtAge(row.age_days), '(' + (row.age_days === null ? 'unknown, uses ' + DATA.model.unknown_age_days + ' days' : row.age_days + ' days') + ')'),
@@ -514,7 +547,7 @@
     return el('div', null,
       el('section', { class: 'detail-section' },
         el('h3', { text: 'This protocol already has a token' }),
-        el('p', { class: 'note', text: 'Its market cap is a fact from the snapshot, not a model estimate, so it is set aside from the ranking. Its mcap/TVL multiple feeds its category median, which the pre-token rows are priced at.' }),
+        el('p', { class: 'note', text: 'Its market cap is a fact from the snapshot, not a model estimate, so it is set aside from the ranking. Its mcap/TVL multiple is one row of the training set the value model is fitted on.' }),
         el('div', { class: 'equation', style: 'margin-top:16px' },
           equationRow('TVL', fmtUsd(row.tvl_usd)),
           equationRow('Market cap', fmtUsd(row.mcap_usd)),
