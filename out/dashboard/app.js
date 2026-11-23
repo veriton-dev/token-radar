@@ -287,6 +287,21 @@
     ));
   }
 
+  // One quiet line under the board: how many pre-token protocols the ranking leaves out, and the
+  // three most common reasons. It is counted from DATA.set_aside and omitted when that list is absent.
+  function setAsideFootnote() {
+    var aside = DATA.set_aside;
+    if (!aside || !aside.length) return null;
+    var counts = {};
+    aside.forEach(function (p) {
+      var reason = String(p.reason || 'other').split(':')[0].trim() || 'other';
+      counts[reason] = (counts[reason] || 0) + 1;
+    });
+    var top = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a] || (a < b ? -1 : 1); }).slice(0, 3);
+    var reasons = top.map(function (r) { return r + ' (' + counts[r] + ')'; }).join(', ');
+    return el('p', { class: 'board-footnote', text: 'Set aside: ' + aside.length + ' pre-token protocol' + (aside.length === 1 ? '' : 's') + ' left out of the ranking; top reasons ' + reasons + '.' });
+  }
+
   function preTable(list) {
     var max = 1;
     list.forEach(function (r) { if (r.implied_value_usd && r.implied_value_usd > max) max = r.implied_value_usd; });
@@ -334,7 +349,8 @@
           )),
           tbody
         )
-      )
+      ),
+      setAsideFootnote()
     );
   }
 
