@@ -252,6 +252,19 @@ export interface LiveRow {
   multiple: number | null;
 }
 
+/** A protocol that records a token but no market cap: it is not pre-token, so the board cannot rank it, and
+ *  it has no mcap to show, so the traded set cannot list a multiple for it either. The snapshot still lists
+ *  it, so the page names it in its own group rather than losing it between the two. */
+export interface PendingRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  change_7d: number | null;
+  symbol: string | null;
+}
+
 /** Everything the dashboard needs: the board, the traded set, the peer table and the model it runs. */
 export interface RadarData {
   as_of: string;
@@ -263,9 +276,14 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  pending_size: number;
+  aside_size: number;
+  accounted_size: number;
+  universe_size: number;
   peer_table: PeerTable;
   fitted_model: FittedModel;
   rows: RadarRow[];
+  pending: PendingRow[];
   live: LiveRow[];
 }
 
@@ -880,6 +898,29 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
 }
 
 /** Every protocol whose record already carries a traded token, by market cap, with its own mcap/TVL multiple. */
+/** A protocol that names a token symbol but records no market cap. It is neither a pre-token launch candidate
+ *  nor a traded peer with a multiple, so `liveRows` drops it and `isRankable` refuses it; without this list the
+ *  page would leave it out of every count while the snapshot still carries it. */
+export function isPending(p: SnapshotProtocol): boolean {
+  return !isPreToken(p) && p.mcap_usd === null;
+}
+
+/** Every protocol that records a token but no market cap, by TVL, with the symbol the snapshot records. */
+export function pendingRows(snapshot: Snapshot): PendingRow[] {
+  return snapshot.protocols
+    .filter(isPending)
+    .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
+    .map((p) => ({
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      chains: p.chains,
+      tvl_usd: p.tvl_usd,
+      change_7d: p.change_7d,
+      symbol: p.symbol,
+    }));
+}
+
 export function liveRows(snapshot: Snapshot): LiveRow[] {
   return snapshot.protocols
     .filter((p) => p.mcap_usd !== null)
@@ -941,7 +982,13 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const fitted = fitValueModel(snapshot, model);
   const board = buildBoard(snapshot, fitted, model);
   const live = liveRows(snapshot);
+  const pending = pendingRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  // Every protocol the snapshot carries lands in exactly one of four places: ranked on the board, set aside as a
+  // derivative of a token that already trades, traded with a market cap, or naming a token with no cap. Counting
+  // all four is what lets the page say how much of the universe it shows instead of quietly dropping a group.
+  const asideCount = setAside(snapshot).length;
+  const accounted = board.length + asideCount + live.length + pending.length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -952,9 +999,14 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: early,
     live_size: live.length,
+    pending_size: pending.length,
+    aside_size: asideCount,
+    accounted_size: accounted,
+    universe_size: snapshot.protocols.length,
     peer_table: peerTable,
     fitted_model: fitted,
     rows: board.map(radarRow),
+    pending,
     live,
   };
   return { board, radar, peerTable, fitted };
