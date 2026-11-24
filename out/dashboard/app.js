@@ -82,16 +82,23 @@
       return Object.assign({ kind: 'live', rank: null, implied_value_usd: null, implied_low: null, implied_high: null, peer_multiple: r.multiple, age_days: null, name: r.name, slug: r.slug }, r);
     });
   }
+  function untradedRows() {
+    return DATA.untraded.map(function (r) {
+      return Object.assign({ kind: 'untraded', rank: null, implied_value_usd: null, implied_low: null, implied_high: null, peer_multiple: null, age_days: null, mcap_usd: null, name: r.name, slug: r.slug }, r);
+    });
+  }
   function universe() {
     if (state.tab === 'live') return liveRows();
-    if (state.tab === 'all') return preRows().concat(liveRows());
+    if (state.tab === 'untraded') return untradedRows();
+    if (state.tab === 'all') return preRows().concat(liveRows()).concat(untradedRows());
     return preRows();
   }
   function matches(r) {
     if (state.category !== 'all' && (r.category || 'Other') !== state.category) return false;
     var q = state.q.trim().toLowerCase();
     if (!q) return true;
-    var hay = [r.name, r.slug, r.category, (r.chains || []).join(' '), r.kind === 'live' ? 'traded token live' : 'pre-token'].join(' ').toLowerCase();
+    var kindWord = r.kind === 'live' ? 'traded token live' : r.kind === 'untraded' ? 'token recorded no market cap untraded' : 'pre-token';
+    var hay = [r.name, r.slug, r.category, (r.chains || []).join(' '), r.symbol || '', kindWord].join(' ').toLowerCase();
     return hay.indexOf(q) >= 0;
   }
   function view() {
@@ -109,7 +116,9 @@
       case 'high': return r.implied_high === null || r.implied_high === undefined ? -Infinity : r.implied_high;
       case 'mcap': return r.mcap_usd === null || r.mcap_usd === undefined ? -Infinity : r.mcap_usd;
       case 'rank': return r.kind === 'live' ? Infinity : r.rank;
-      default: return r.implied_value_usd === null || r.implied_value_usd === undefined ? -Infinity : r.implied_value_usd;
+      default:
+        if (r.kind !== 'pre') return -Infinity;
+        return r.implied_value_usd === null || r.implied_value_usd === undefined ? -Infinity : r.implied_value_usd;
     }
   }
   function sortedRows(list) {
@@ -129,7 +138,7 @@
     if (params.get('q')) state.q = params.get('q');
     if (params.get('p')) state.selected = params.get('p');
     if (params.get('category')) state.category = params.get('category');
-    if (params.get('view') === 'live' || params.get('view') === 'all' || params.get('view') === 'pre-token') state.tab = params.get('view');
+    if (params.get('view') === 'live' || params.get('view') === 'all' || params.get('view') === 'untraded' || params.get('view') === 'pre-token') state.tab = params.get('view');
   }
   function writeHash() {
     var params = new URLSearchParams();
@@ -170,7 +179,17 @@
         el('div', { class: 'fact' }, el('b', { class: 'amber', text: String(DATA.board_size) }), el('span', { text: 'pre-token rows ranked' })),
         el('div', { class: 'fact' }, el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size }), el('span', { text: 'watchlist covered' })),
         el('div', { class: 'fact' }, el('b', { class: 'teal', text: String(DATA.fitted_model.training_count) }), el('span', { text: 'traded peers fitted' })),
-        el('div', { class: 'fact' }, el('b', { text: String(DATA.live_size) }), el('span', { text: 'token already trading' }))
+        el('div', { class: 'fact' }, el('b', { text: String(DATA.live_size) }), el('span', { text: 'token already trading' })),
+        el('div', { class: 'fact' }, el('b', { text: String(DATA.untraded_size) }), el('span', { text: 'token, no market cap' })),
+        el('div', { class: 'fact' }, el('b', { text: String(DATA.total_protocols) }), el('span', { text: 'protocols in the snapshot' }))
+      ),
+      el('p', { class: 'lede accounting' },
+        'The four states add up to the whole snapshot: ',
+        el('strong', { text: DATA.board_size + ' ranked' }), ' + ',
+        el('strong', { text: DATA.set_aside.length + ' set aside' }), ' (a pre-token record that is a derivative of a token already trading, listed in the detail view) + ',
+        el('strong', { text: DATA.live_size + ' traded' }), ' + ',
+        el('strong', { text: DATA.untraded_size + ' token recorded without a market cap' }),
+        ' = ', el('strong', { text: String(DATA.total_protocols) }), '. No protocol in the snapshot is unaccounted for.'
       )
     );
   }
@@ -281,7 +300,8 @@
       el('div', { class: 'field' }, el('label', { text: 'Token status' }), el('div', { class: 'seg', role: 'group', 'aria-label': 'Token status' },
         seg('pre-token', 'Pre-token (' + DATA.board_size + ')'),
         seg('live', 'Traded peers (' + DATA.live_size + ')'),
-        seg('all', 'All')
+        seg('untraded', 'Token, no mcap (' + DATA.untraded_size + ')'),
+        seg('all', 'All (' + (DATA.board_size + DATA.live_size + DATA.untraded_size) + ')')
       )),
       el('span', { class: 'count' }, el('b', { text: String(n) }), ' rows shown')
     );
@@ -425,25 +445,26 @@
     list.forEach(function (r) {
       var growthClass = r.change_7d === null || r.change_7d === undefined ? 'muted' : r.change_7d >= 0 ? 'pos' : 'neg';
       var isLive = r.kind === 'live';
+      var isUntraded = r.kind === 'untraded';
       tbody.appendChild(el('tr', {
         'data-selected': state.selected === r.slug ? 'true' : 'false',
         tabindex: '0',
         onclick: function () { selectRow(r.slug, r.kind); },
         onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectRow(r.slug, r.kind); } }
       },
-        el('td', null, el('span', { class: 'pill ' + (isLive ? 'buy' : 'cat'), text: isLive ? 'traded' : 'pre-token' })),
-        el('td', null, el('span', { class: 'rank' + (!isLive && r.rank <= 3 ? ' top' : ''), text: isLive ? '\u2013' : String(r.rank) })),
+        el('td', null, el('span', { class: 'pill ' + (isLive ? 'buy' : isUntraded ? 'cat' : 'cat'), text: isLive ? 'traded' : isUntraded ? 'untraded' : 'pre-token' })),
+        el('td', null, el('span', { class: 'rank' + (!isLive && !isUntraded && r.rank <= 3 ? ' top' : ''), text: isLive || isUntraded ? '\u2013' : String(r.rank) })),
         nameCell(r),
         el('td', null, el('span', { class: 'pill cat', text: r.category || 'Other' })),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthClass, text: fmtPct(r.change_7d) }),
-        el('td', null, isLive ? el('span', { class: 'num muted', text: fmtUsd(r.mcap_usd) }) : el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) }))
+        el('td', null, isLive ? el('span', { class: 'num muted', text: fmtUsd(r.mcap_usd) }) : isUntraded ? el('span', { class: 'num muted', text: 'no mcap' }) : el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) }))
       ));
     });
     return el('div', { class: 'panel' },
       el('div', { class: 'table-wrap' },
         el('table', null,
-          el('caption', { text: 'Both groups side by side: pre-token protocols with a model value, and traded peers with the market\'s own value. The two are visibly separate.' }),
+          el('caption', { text: 'All three token states side by side: pre-token protocols with a model value, traded peers with the market\'s own value, and the protocols that record a token but no market cap. The groups stay visibly separate.' }),
           el('thead', null, el('tr', null,
             el('th', { scope: 'col', text: 'Status' }),
             sortHeader('rank', 'Rank'),
@@ -467,10 +488,47 @@
     ));
   }
 
+  function untradedTable(list) {
+    var tbody = el('tbody');
+    list.forEach(function (r) {
+      var growthClass = r.change_7d === null || r.change_7d === undefined ? 'muted' : r.change_7d >= 0 ? 'pos' : 'neg';
+      tbody.appendChild(el('tr', {
+        'data-selected': state.selected === r.slug ? 'true' : 'false',
+        tabindex: '0',
+        onclick: function () { selectRow(r.slug, 'untraded'); },
+        onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectRow(r.slug, 'untraded'); } }
+      },
+        el('td', null, el('span', { class: 'pill cat', text: 'untraded' })),
+        nameCell(r),
+        el('td', null, el('span', { class: 'pill cat', text: r.category || 'Other' })),
+        el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
+        el('td', { class: 'num ' + growthClass, text: fmtPct(r.change_7d) }),
+        el('td', { class: 'num', text: r.symbol || '\u2013' })
+      ));
+    });
+    return el('div', { class: 'panel' },
+      el('div', { class: 'table-wrap' },
+        el('table', null,
+          el('caption', { text: 'Token recorded, no market cap: ' + list.length + ' protocols whose DefiLlama record names a token but carries no market cap. They are not ranked (an implied token value would need the very figure the record lacks) and they never enter the fitting set, but they are named here so the page accounts for every protocol in the snapshot rather than dropping a third of the field.' }),
+          el('thead', null, el('tr', null,
+            el('th', { scope: 'col', text: 'Status' }),
+            sortHeader('name', 'Protocol'),
+            sortHeader('category', 'Category'),
+            sortHeader('tvl', 'TVL'),
+            sortHeader('growth', '7d'),
+            el('th', { scope: 'col', text: 'Symbol the record names' })
+          )),
+          tbody
+        )
+      )
+    );
+  }
+
   function board() {
     var list = sortedRows(view());
     if (list.length === 0) return emptyPanel();
     if (state.tab === 'live') return liveTable(list);
+    if (state.tab === 'untraded') return untradedTable(list);
     if (state.tab === 'all') return allTable(list);
     return preTable(list);
   }
@@ -558,22 +616,39 @@
     );
   }
 
+  function untradedDetail(row) {
+    return el('div', null,
+      el('section', { class: 'detail-section' },
+      el('h3', { text: 'A token is recorded, but no market cap for it' }),
+      el('p', { class: 'note', text: 'The snapshot\'s record for this protocol names a token (' + (row.symbol || row.gecko_id || 'unnamed') + ') while carrying no market cap. A ranking needs an implied token value, and that value is built from the market-cap-to-TVL multiple fitted on protocols that trade; this one contributes no multiple because it has no market cap to divide. It is not cut from the page: the radar names all three states rather than pretend the protocol is not there.' }),
+      el('div', { class: 'equation', style: 'margin-top:16px' },
+        equationRow('TVL', fmtUsd(row.tvl_usd)),
+        equationRow('7d TVL change', fmtPct(row.change_7d)),
+        equationRow('Symbol the record names', row.symbol || '\u2013'),
+        equationRow('Ranked', 'no', 'a value needs a fit this record cannot join', true)
+      )
+      )
+    );
+  }
+
   function openDetail(slug, kind) {
-    var row = (kind === 'live' ? liveRows() : preRows()).filter(function (r) { return r.slug === slug; })[0];
-    if (!row) row = preRows().filter(function (r) { return r.slug === slug; })[0] || liveRows().filter(function (r) { return r.slug === slug; })[0];
+    var all = preRows().concat(liveRows()).concat(untradedRows());
+    var row = all.filter(function (r) { return r.slug === slug; })[0];
     if (!row) return;
     state.selected = slug;
     dialog.textContent = '';
     var isLive = row.kind === 'live';
+    var isUntraded = row.kind === 'untraded';
+    var label = isLive ? 'Traded peer' : isUntraded ? 'Token recorded, unranked' : 'Rank ' + row.rank + ' of ' + DATA.board_size;
     dialog.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
-        el('span', { class: 'brand-name', text: isLive ? 'Traded peer' : 'Rank ' + row.rank + ' of ' + DATA.board_size }),
+        el('span', { class: 'brand-name', text: label }),
         el('h2', { id: 'detail-title', text: row.name }),
         el('p', { class: 'sub', text: (row.category || 'Other') + ' \u00b7 ' + (row.chains && row.chains.length ? row.chains.join(', ') : 'chain not recorded') })
       ),
       el('button', { class: 'close', type: 'button', 'aria-label': 'Close details', text: 'Close', onclick: function () { dialog.close(); } })
     ));
-    dialog.appendChild(isLive ? liveDetail(row) : preDetail(row));
+    dialog.appendChild(isLive ? liveDetail(row) : isUntraded ? untradedDetail(row) : preDetail(row));
     if (typeof dialog.showModal === 'function') {
       if (!dialog.open) dialog.showModal();
     } else {

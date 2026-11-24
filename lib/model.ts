@@ -252,6 +252,24 @@ export interface LiveRow {
   multiple: number | null;
 }
 
+/** A protocol whose record names a token but carries no market cap for it.
+ *
+ *  These are the snapshot's third state, and the one a board is most likely to lose: the record is not
+ *  pre-token (it names a symbol or a gecko id), so it cannot be ranked on an implied token value, and it is
+ *  not a traded peer either (no mcap), so it cannot enter the multiple fitting set. Dropped from both, it
+ *  disappears from the page entirely and the reader cannot tell whether the protocol was considered.
+ *  It is neither ranked nor trained on: it is *accounted for*, with the symbol the record does name. */
+export interface UntradedRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  change_7d: number | null;
+  symbol: string | null;
+  gecko_id: string | null;
+}
+
 /** Everything the dashboard needs: the board, the traded set, the peer table and the model it runs. */
 export interface RadarData {
   as_of: string;
@@ -267,6 +285,9 @@ export interface RadarData {
   fitted_model: FittedModel;
   rows: RadarRow[];
   live: LiveRow[];
+  untraded: UntradedRow[];
+  untraded_size: number;
+  total_protocols: number;
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -896,6 +917,28 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     }));
 }
 
+/** The protocols that record a token but no market cap: named, counted, and kept out of both the ranking
+ *  and the fitting set, so the page accounts for all three states instead of silently dropping one.
+ *
+ *  `isPreToken` already excludes these from the board, and `liveRows` excludes them from the peers, so
+ *  without this list they exist in the snapshot and nowhere on the page. They are sorted by TVL: the
+ *  biggest one is the most conspicuous omission if it were missing. */
+export function untradedRows(snapshot: Snapshot): UntradedRow[] {
+  return snapshot.protocols
+    .filter((p) => !isPreToken(p) && p.mcap_usd === null)
+    .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
+    .map((p) => ({
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      chains: p.chains,
+      tvl_usd: p.tvl_usd,
+      change_7d: p.change_7d,
+      symbol: p.symbol,
+      gecko_id: p.gecko_id,
+    }));
+}
+
 /** A board row's compact form for data.js, with the farm plan carried as the board wrote it. */
 export function radarRow(row: BoardRow): RadarRow {
   return {
@@ -941,6 +984,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const fitted = fitValueModel(snapshot, model);
   const board = buildBoard(snapshot, fitted, model);
   const live = liveRows(snapshot);
+  const untraded = untradedRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -952,6 +996,9 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: early,
     live_size: live.length,
+    untraded,
+    untraded_size: untraded.length,
+    total_protocols: snapshot.protocols.length,
     peer_table: peerTable,
     fitted_model: fitted,
     rows: board.map(radarRow),
